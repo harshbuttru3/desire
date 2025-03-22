@@ -17,7 +17,7 @@ const MessageList = ({ messages, room }) => {
   if (!room) {
     return (
       <div className="flex items-center justify-center h-full text-gray-500 dark:text-gray-400">
-        Select a room to start chatting
+        Select a room to start chatting aman
       </div>
     );
   }
