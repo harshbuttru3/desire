@@ -3,6 +3,7 @@ const router = express.Router();
 const Message = require('../models/Message');
 const Room = require('../models/Room');
 const { auth } = require('../middleware/auth');
+const mongoose = require('mongoose');
 
 // Get room messages
 router.get('/room/:roomId', auth, async (req, res) => {
@@ -22,9 +23,11 @@ router.get('/room/:roomId', auth, async (req, res) => {
       return res.status(403).json({ error: 'You are banned from this room' });
     }
 
+    // Get messages and check expiration
     const messages = await Message.find({
       room: req.params.roomId,
-      deleted: false
+      deleted: false,
+      isExpired: false
     })
       .sort({ createdAt: -1 })
       .skip((page - 1) * limit)
@@ -32,9 +35,20 @@ router.get('/room/:roomId', auth, async (req, res) => {
       .populate('sender', 'username avatar')
       .populate('mentions', 'username');
 
-    res.json(messages);
+    // Check expiration for each message
+    for (const message of messages) {
+      if (message.checkExpiration()) {
+        await message.save();
+      }
+    }
+
+    // Filter out expired messages
+    const activeMessages = messages.filter(msg => !msg.isExpired);
+
+    res.json(activeMessages);
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    console.error('Error fetching room messages:', error);
+    res.status(500).json({ error: 'Server error' });
   }
 });
 
@@ -62,18 +76,87 @@ router.get('/private/:userId', auth, async (req, res) => {
   }
 });
 
-// Send message to room
-router.post('/room/:roomId', auth, async (req, res) => {
+// Get room messages (using roomId query parameter)
+router.get('/', auth, async (req, res) => {
   try {
-    const { content, type = 'text', fileUrl, fileName, fileSize, fileType } = req.body;
-    const room = await Room.findById(req.params.roomId);
+    const { roomId, page = 1, limit = 50 } = req.query;
+    
+    if (!roomId) {
+      return res.status(400).json({ error: 'Room ID is required' });
+    }
+    
+    if (!mongoose.Types.ObjectId.isValid(roomId)) {
+      return res.status(400).json({ error: 'Invalid room ID format' });
+    }
+    
+    const room = await Room.findById(roomId);
 
     if (!room) {
       return res.status(404).json({ error: 'Room not found' });
     }
 
     // Check if user is banned
-    const isBanned = room.bannedUsers.some(
+    const isBanned = room.bannedUsers && room.bannedUsers.some(
+      ban => ban.user.toString() === req.user._id.toString()
+    );
+    if (isBanned) {
+      return res.status(403).json({ error: 'You are banned from this room' });
+    }
+
+    // Get messages and check expiration
+    const messages = await Message.find({
+      room: roomId,
+      deleted: false,
+      isExpired: false
+    })
+      .sort({ createdAt: -1 })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .populate('sender', 'username avatar')
+      .populate('mentions', 'username');
+
+    // Check expiration for each message
+    for (const message of messages) {
+      if (message.checkExpiration()) {
+        await message.save();
+      }
+    }
+
+    // Filter out expired messages
+    const activeMessages = messages.filter(msg => !msg.isExpired);
+
+    res.json(activeMessages);
+  } catch (error) {
+    console.error('Error fetching room messages:', error);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Send message (using roomId in request body)
+router.post('/', auth, async (req, res) => {
+  try {
+    const { roomId, content, type = 'text', fileUrl, fileName, fileSize, fileType } = req.body;
+    
+    if (!content && type === 'text') {
+      return res.status(400).json({ error: 'Message content is required' });
+    }
+    
+    if (!roomId) {
+      return res.status(400).json({ error: 'Room ID is required' });
+    }
+    
+    if (!mongoose.Types.ObjectId.isValid(roomId)) {
+      return res.status(400).json({ error: 'Invalid room ID format' });
+    }
+    
+    const room = await Room.findById(roomId);
+
+    if (!room) {
+      return res.status(404).json({ error: 'Room not found' });
+    }
+
+    // Check if user is banned
+    const isBanned = room.bannedUsers && room.bannedUsers.some(
       ban => ban.user.toString() === req.user._id.toString()
     );
     if (isBanned) {
@@ -82,37 +165,33 @@ router.post('/room/:roomId', auth, async (req, res) => {
 
     // Check if user is a member
     const isMember = room.members.some(
-      member => member.user.toString() === req.user._id.toString()
+      member => member.toString() === req.user._id.toString()
     );
+    
     if (!isMember) {
-      return res.status(403).json({ error: 'You must be a member to send messages' });
+      room.members.push(req.user._id);
+      await room.save();
     }
 
     const message = new Message({
       sender: req.user._id,
-      room: req.params.roomId,
+      room: roomId,
       content,
       type,
       fileUrl,
       fileName,
       fileSize,
-      fileType
+      fileType,
+      expiresAt: new Date(Date.now() + 10 * 60 * 1000) // 10 minutes from now
     });
 
     await message.save();
-
-    // Update last read for sender
-    const memberIndex = room.members.findIndex(
-      member => member.user.toString() === req.user._id.toString()
-    );
-    if (memberIndex !== -1) {
-      room.members[memberIndex].lastRead = new Date();
-      await room.save();
-    }
+    await message.populate('sender', 'username avatar');
 
     res.status(201).json(message);
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    console.error('Error sending message:', error);
+    res.status(500).json({ error: error.message || 'Server error' });
   }
 });
 

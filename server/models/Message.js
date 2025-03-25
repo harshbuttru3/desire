@@ -64,6 +64,14 @@ const messageSchema = new mongoose.Schema({
   createdAt: {
     type: Date,
     default: Date.now
+  },
+  expiresAt: {
+    type: Date,
+    default: () => new Date(Date.now() + 10 * 60 * 1000) // 10 minutes from now
+  },
+  isExpired: {
+    type: Boolean,
+    default: false
   }
 });
 
@@ -71,6 +79,16 @@ const messageSchema = new mongoose.Schema({
 messageSchema.index({ room: 1, createdAt: -1 });
 messageSchema.index({ sender: 1 });
 messageSchema.index({ 'mentions': 1 });
+messageSchema.index({ expiresAt: 1 });
+
+// Add a method to check if message is expired
+messageSchema.methods.checkExpiration = function() {
+  if (!this.isExpired && this.expiresAt < new Date()) {
+    this.isExpired = true;
+    return true;
+  }
+  return false;
+};
 
 const Message = mongoose.model('Message', messageSchema);
 

@@ -1,21 +1,140 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import io from 'socket.io-client';
-import axios from 'axios';
+import axios from '../utils/axios';
 import RoomList from '../components/chat/RoomList';
-import MessageList from '../components/chat/MessageList';
-import MessageInput from '../components/chat/MessageInput';
+import ChatComponent from '../components/chat/Chat';
 import { useAuth } from '../contexts/AuthContext';
+
+// Constants for localStorage
+const MESSAGE_CACHE_KEY = 'chat_message_cache';
+const MESSAGE_CACHE_TIMESTAMP = 'chat_message_cache_timestamp';
+const CACHE_TTL = 10 * 60 * 1000; // 10 minutes in milliseconds
 
 const Chat = () => {
   const [socket, setSocket] = useState(null);
-  const [rooms, setRooms] = useState([]);
   const [selectedRoom, setSelectedRoom] = useState(null);
-  const [messages, setMessages] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // Message cache to persist messages between room changes and page reloads
+  const [messageCache, setMessageCache] = useState(() => {
+    // Initialize from localStorage if available and not expired
+    try {
+      const cachedData = localStorage.getItem(MESSAGE_CACHE_KEY);
+      const timestamp = localStorage.getItem(MESSAGE_CACHE_TIMESTAMP);
+      
+      if (cachedData && timestamp) {
+        const now = Date.now();
+        const cacheTime = parseInt(timestamp, 10);
+        
+        // Only use cache if it's less than 10 minutes old
+        if (now - cacheTime < CACHE_TTL) {
+          return JSON.parse(cachedData);
+        }
+      }
+    } catch (error) {
+      console.error('Error loading message cache from localStorage', error);
+    }
+    
+    return {};
+  });
+  
   const { user } = useAuth();
   const navigate = useNavigate();
+
+  // Save message cache to localStorage whenever it changes
+  useEffect(() => {
+    try {
+      localStorage.setItem(MESSAGE_CACHE_KEY, JSON.stringify(messageCache));
+      localStorage.setItem(MESSAGE_CACHE_TIMESTAMP, Date.now().toString());
+    } catch (error) {
+      console.error('Error saving message cache to localStorage', error);
+    }
+  }, [messageCache]);
+
+  // Fetch messages for the selected room
+  const fetchMessages = useCallback(async (roomId) => {
+    try {
+      const response = await axios.get(`/api/messages`, {
+        params: { roomId }
+      });
+      
+      if (response.data && response.data.length > 0) {
+        // Update the cache with fetched messages
+        setMessageCache(prev => ({
+          ...prev,
+          [roomId]: response.data.reverse()
+        }));
+        return response.data.reverse();
+      } 
+      return [];
+    } catch (error) {
+      console.error('Error fetching messages:', error);
+      return [];
+    }
+  }, []);
+
+  // Add a message to the cache
+  const addMessageToCache = useCallback((roomId, message) => {
+    setMessageCache(prev => {
+      const roomMessages = prev[roomId] || [];
+      // Check if message already exists to avoid duplicates
+      if (!roomMessages.some(msg => msg._id === message._id)) {
+        return {
+          ...prev,
+          [roomId]: [...roomMessages, message]
+        };
+      }
+      return prev;
+    });
+  }, []);
+
+  // Update a message in the cache
+  const updateMessageInCache = useCallback((roomId, editedMessage) => {
+    setMessageCache(prev => {
+      const roomMessages = prev[roomId] || [];
+      return {
+        ...prev,
+        [roomId]: roomMessages.map(msg => 
+          msg._id === editedMessage._id ? editedMessage : msg
+        )
+      };
+    });
+  }, []);
+
+  // Remove a message from the cache
+  const removeMessageFromCache = useCallback((roomId, messageId) => {
+    setMessageCache(prev => {
+      const roomMessages = prev[roomId] || [];
+      return {
+        ...prev,
+        [roomId]: roomMessages.filter(msg => msg._id !== messageId)
+      };
+    });
+  }, []);
+
+  // Clean expired messages from cache
+  const cleanExpiredMessages = useCallback(() => {
+    const now = new Date();
+    
+    setMessageCache(prev => {
+      const newCache = { ...prev };
+      
+      // Check each room's messages
+      Object.keys(newCache).forEach(roomId => {
+        const roomMessages = newCache[roomId];
+        if (roomMessages && roomMessages.length > 0) {
+          // Filter out messages that have expired
+          newCache[roomId] = roomMessages.filter(msg => {
+            if (!msg.expiresAt) return true;
+            return new Date(msg.expiresAt) > now;
+          });
+        }
+      });
+      
+      return newCache;
+    });
+  }, []);
 
   useEffect(() => {
     if (!user) {
@@ -23,7 +142,8 @@ const Chat = () => {
       return;
     }
 
-    const newSocket = io(process.env.REACT_APP_API_URL, {
+    const socketUrl = process.env.REACT_APP_WS_URL || 'http://localhost:5000';
+    const newSocket = io(socketUrl, {
       auth: {
         token: localStorage.getItem('token')
       }
@@ -40,136 +160,59 @@ const Chat = () => {
       setLoading(false);
     });
 
-    newSocket.on('message', (message) => {
-      if (selectedRoom && message.roomId === selectedRoom._id) {
-        setMessages(prev => [...prev, message]);
-      }
-    });
-
-    newSocket.on('message_edited', (message) => {
-      if (selectedRoom && message.roomId === selectedRoom._id) {
-        setMessages(prev => prev.map(msg => 
-          msg._id === message._id ? message : msg
-        ));
-      }
-    });
-
-    newSocket.on('message_deleted', (messageId) => {
-      if (selectedRoom) {
-        setMessages(prev => prev.filter(msg => msg._id !== messageId));
-      }
-    });
-
     setSocket(newSocket);
+
+    // Clean expired messages when component mounts
+    cleanExpiredMessages();
+    
+    // Set up interval to clean expired messages every minute
+    const cleanupInterval = setInterval(cleanExpiredMessages, 60000);
 
     return () => {
       newSocket.close();
+      clearInterval(cleanupInterval);
     };
-  }, [user, navigate, selectedRoom]);
+  }, [user, navigate, cleanExpiredMessages]);
 
+  // Socket event listeners for messages
   useEffect(() => {
-    const fetchRooms = async () => {
-      try {
-        const response = await axios.get(`${process.env.REACT_APP_API_URL}/api/rooms`, {
-          headers: {
-            Authorization: `Bearer ${localStorage.getItem('token')}`
-          }
-        });
-        setRooms(response.data);
-      } catch (error) {
-        console.error('Error fetching rooms:', error);
-        setError('Failed to fetch chat rooms');
-      }
-    };
-
-    fetchRooms();
-  }, []);
-
-  useEffect(() => {
-    const fetchMessages = async () => {
-      if (!selectedRoom) return;
-
-      try {
-        const response = await axios.get(
-          `${process.env.REACT_APP_API_URL}/api/messages/${selectedRoom._id}`,
-          {
-            headers: {
-              Authorization: `Bearer ${localStorage.getItem('token')}`
-            }
-          }
-        );
-        setMessages(response.data);
-      } catch (error) {
-        console.error('Error fetching messages:', error);
-        setError('Failed to fetch messages');
-      }
-    };
-
-    fetchMessages();
-  }, [selectedRoom]);
-
-  const handleSendMessage = async (content) => {
-    if (!selectedRoom || !socket) return;
-
-    try {
-      const response = await axios.post(
-        `${process.env.REACT_APP_API_URL}/api/messages`,
-        {
-          roomId: selectedRoom._id,
-          content
-        },
-        {
-          headers: {
-            Authorization: `Bearer ${localStorage.getItem('token')}`
-          }
-        }
-      );
-
-      socket.emit('message', response.data);
-    } catch (error) {
-      console.error('Error sending message:', error);
-      setError('Failed to send message');
-    }
-  };
-
-  const handleEditMessage = async (messageId, content) => {
     if (!socket) return;
 
-    try {
-      const response = await axios.patch(
-        `${process.env.REACT_APP_API_URL}/api/messages/${messageId}`,
-        { content },
-        {
-          headers: {
-            Authorization: `Bearer ${localStorage.getItem('token')}`
-          }
-        }
-      );
+    // Listen for new messages
+    socket.on('message', (newMessage) => {
+      addMessageToCache(newMessage.room, newMessage);
+    });
 
-      socket.emit('message_edited', response.data);
-    } catch (error) {
-      console.error('Error editing message:', error);
-      setError('Failed to edit message');
+    // Listen for edited messages
+    socket.on('message_edited', (editedMessage) => {
+      updateMessageInCache(editedMessage.room, editedMessage);
+    });
+
+    // Listen for deleted messages
+    socket.on('message_deleted', (messageId) => {
+      // Note: We would need the roomId here as well to properly remove from cache
+      if (selectedRoom) {
+        removeMessageFromCache(selectedRoom._id, messageId);
+      }
+    });
+
+    return () => {
+      socket.off('message');
+      socket.off('message_edited');
+      socket.off('message_deleted');
+    };
+  }, [socket, selectedRoom, addMessageToCache, updateMessageInCache, removeMessageFromCache]);
+
+  const handleSelectRoom = async (room) => {
+    setSelectedRoom(room);
+    
+    if (socket) {
+      socket.emit('join_room', room._id);
     }
-  };
-
-  const handleDeleteMessage = async (messageId) => {
-    if (!socket) return;
-
-    try {
-      await axios.delete(
-        `${process.env.REACT_APP_API_URL}/api/messages/${messageId}`,
-        {
-          headers: {
-            Authorization: `Bearer ${localStorage.getItem('token')}`
-          }
-        }
-      );
-
-      socket.emit('message_deleted', messageId);
-    } catch (error) {
-      console.error('Error deleting message:', error);
-      setError('Failed to delete message');
+    
+    // If we don't have messages for this room in cache, fetch them
+    if (!messageCache[room._id] || messageCache[room._id].length === 0) {
+      await fetchMessages(room._id);
     }
   };
 
@@ -190,39 +233,29 @@ const Chat = () => {
   }
 
   return (
-    <div className="flex h-screen">
+    <div className="flex h-[calc(100vh-64px)] bg-white dark:bg-gray-800 rounded-lg shadow-lg overflow-hidden">
       <div className="w-1/4 border-r dark:border-gray-700">
         <RoomList
-          rooms={rooms}
-          selectedRoom={selectedRoom}
-          onSelectRoom={setSelectedRoom}
+          onSelectRoom={handleSelectRoom}
+          selectedRoomId={selectedRoom?._id}
         />
       </div>
       <div className="flex-1 flex flex-col">
-        {selectedRoom ? (
-          <>
-            <div className="p-4 border-b dark:border-gray-700">
-              <h2 className="text-xl font-semibold">{selectedRoom.name}</h2>
-              <p className="text-sm text-gray-500 dark:text-gray-400">
-                {selectedRoom.isPrivate ? 'Private Room' : 'Public Room'}
-              </p>
-            </div>
-            <div className="flex-1 overflow-y-auto">
-              <MessageList
-                messages={messages}
-                onEditMessage={handleEditMessage}
-                onDeleteMessage={handleDeleteMessage}
-              />
-            </div>
-            <MessageInput onSendMessage={handleSendMessage} room={selectedRoom} />
-          </>
-        ) : (
-          <div className="flex items-center justify-center h-full">
-            <p className="text-gray-500 dark:text-gray-400">
-              Select a room to start chatting
-            </p>
-          </div>
-        )}
+        <ChatComponent 
+          selectedRoom={selectedRoom} 
+          socket={socket} 
+          messages={selectedRoom ? messageCache[selectedRoom._id] || [] : []}
+          onSendMessage={(content) => {
+            if (socket && selectedRoom) {
+              socket.emit('message', {
+                roomId: selectedRoom._id,
+                content: content.trim(),
+                type: 'text'
+              });
+            }
+          }}
+          fetchMessages={() => selectedRoom && fetchMessages(selectedRoom._id)}
+        />
       </div>
     </div>
   );

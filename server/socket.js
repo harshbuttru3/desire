@@ -117,12 +117,11 @@ const setupSocket = (server) => {
           fileUrl: message.fileUrl,
           fileName: message.fileName,
           fileSize: message.fileSize,
-          fileType: message.fileType
+          fileType: message.fileType,
+          expiresAt: new Date(Date.now() + 10 * 60 * 1000) // 10 minutes from now
         });
 
         await newMessage.save();
-
-        // Populate sender information
         await newMessage.populate('sender', 'username avatar');
 
         // Broadcast message to room
